@@ -3,6 +3,6 @@
 
 ### 使用方法：
 ```bash
-python md_Migration_Tool.py
+python md_Migration.py
 ```
 按照提示操作就好。
