@@ -6,7 +6,11 @@
 
 
 ### 使用方法：
+
 ```bash
 python md_Migration.py
 ```
+### or 
+下载release包中的md_Migration_Tool V1.0.exe打开即可
+
 按照提示操作就好。
