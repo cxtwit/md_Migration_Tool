@@ -11,6 +11,9 @@
 python md_Migration.py
 ```
 ### or 
-下载release包中的md_Migration_Tool V1.0.exe打开即可
+下载release包中的Md_Migration_Tool_V3.0.exe打开即可
 
 按照提示操作就好。
+
+#### Md_Migration_Tool_V3.0
+  增加markdown合并以及整理markdown图片功能
