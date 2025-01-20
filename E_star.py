@@ -2,18 +2,17 @@ import os
 import shutil
 import re
 import logging
-from tkinter import Tk, Label, Button, Entry, filedialog, messagebox, StringVar, IntVar, Checkbutton, END
+from tkinter import Tk, Label, Button, Entry, filedialog, messagebox, StringVar, IntVar, END, Checkbutton
 from tkinter.scrolledtext import ScrolledText
 from tkinter import ttk
 from datetime import datetime
-
 
 class Application(Tk):
     def __init__(self):
         super().__init__()
         self.title("E_starMarkdowntools")
-        self.geometry("750x300")  
-        self.resizable(False, False)  
+        self.geometry("750x500")
+        self.resizable(False, False)
         self.configure(bg="white")
 
         # 创建选项卡
@@ -110,7 +109,6 @@ class Application(Tk):
         handler = TextHandler(self.log_area)
         logging.getLogger().addHandler(handler)
 
-    # Markdown迁移逻辑
     def on_select_input(self):
         response = messagebox.askyesno("操作模式", "是否需要批量处理所有 Markdown 文件？\n选择“是”请选择文件夹，选择“否”请选择单个 Markdown 文件。")
         if response:
@@ -131,19 +129,31 @@ class Application(Tk):
         merge = self.merge_var.get()
         use_subfolders = self.subfolder_var.get()
 
+        if not source_path:
+            messagebox.showerror("错误", "请选择文件或目录路径！")
+            return
+        if not target_path:
+            messagebox.showerror("错误", "请选择目标目录！")
+            return
+
+        setup_logging(target_path)
+
         try:
-            if os.path.isfile(source_path):
-                self.process_markdown_file(source_path, target_path, use_subfolders=use_subfolders)
-            elif os.path.isdir(source_path):
-                self.process_markdown_directory(source_path, target_path, "images", merge, use_subfolders)
+            if os.path.isdir(source_path):
+                process_markdown_directory(source_path, target_path, merge=merge, use_subfolders=use_subfolders)
+                if merge:
+                    messagebox.showinfo("完成", "批量处理完成，Markdown 文件已合并！")
+                else:
+                    messagebox.showinfo("完成", "批量处理完成！")
+            elif os.path.isfile(source_path) and source_path.lower().endswith(".md"):
+                process_markdown_file(source_path, target_path, use_subfolders=use_subfolders)
+                messagebox.showinfo("完成", "Markdown 文件处理完成！")
             else:
                 raise ValueError("无效的路径类型！")
-            messagebox.showinfo("完成", "Markdown 文件迁移完成！")
         except Exception as e:
             logging.error(f"处理失败：{e}")
             messagebox.showerror("错误", f"处理失败：{e}")
 
-    # 路径处理工具逻辑
     def on_select_md_directory(self):
         directory = filedialog.askdirectory(title="选择 Markdown 文件目录")
         if directory:
@@ -178,7 +188,6 @@ class Application(Tk):
             logging.info(f"无图片引用：{md_file}")
             return
 
-        new_paths = {}
         for index, old_path in enumerate(image_paths):
             old_path = self.normalize_path(old_path.strip())
             old_abs_path = os.path.join(md_folder, old_path) if not os.path.isabs(old_path) else old_path
@@ -189,7 +198,11 @@ class Application(Tk):
             old_filename = os.path.basename(old_abs_path)
             new_filename = f"{prefix}_{index + 1}{os.path.splitext(old_filename)[1].lower()}"
             new_abs_path = os.path.join(images_folder, new_filename)
-            content = content.replace(old_path, os.path.join("images", new_filename))
+
+            # 使用统一路径格式 "./images/"
+            new_relative_path = f"./images/{new_filename}".replace("\\", "/")
+            content = content.replace(old_path, new_relative_path)
+
             shutil.move(old_abs_path, new_abs_path)
 
         with open(md_file, "w", encoding="utf-8") as f:
@@ -219,6 +232,98 @@ class TextHandler(logging.Handler):
         msg = self.format(record)
         self.text_widget.after(0, self.text_widget.insert, END, msg + "\n")
         self.text_widget.after(0, self.text_widget.see, END)
+
+
+def setup_logging(target_path):
+    """配置日志系统：输出日志到目标文件夹"""
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    log_filename = os.path.join(target_path, f"{current_date}_迁移日志.log")
+    logging.basicConfig(
+        filename=log_filename,
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logging.info(f"日志文件路径：{log_filename}")
+
+
+def process_markdown_file(md_file_path, target_path, images_folder="images", use_subfolders=False):
+    """迁移单个 Markdown 文件及其关联的本地图片"""
+    if not os.path.exists(md_file_path):
+        logging.error(f"Markdown 文件不存在: {md_file_path}")
+        return ""
+
+    filename_without_ext = os.path.splitext(os.path.basename(md_file_path))[0]
+
+    if use_subfolders:
+        images_target_path = os.path.join(target_path, images_folder, filename_without_ext)
+    else:
+        images_target_path = os.path.join(target_path, images_folder)
+
+    os.makedirs(images_target_path, exist_ok=True)
+
+    with open(md_file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    markdown_img_pattern = r"!\[.*?\]\((.*?)\)"
+    found_images = re.findall(markdown_img_pattern, content)
+
+    for img_path in found_images:
+        if img_path.startswith("http://") or img_path.startswith("https://"):
+            logging.info(f"跳过远程图片: {img_path}")
+            continue
+
+        img_source_path = os.path.abspath(os.path.join(os.path.dirname(md_file_path), img_path))
+        if not os.path.exists(img_source_path):
+            logging.warning(f"图片文件不存在，跳过: {img_source_path}")
+            continue
+
+        img_filename = os.path.basename(img_source_path)
+        new_img_path = os.path.join(images_target_path, img_filename)
+
+        if os.path.exists(new_img_path):
+            base, ext = os.path.splitext(img_filename)
+            counter = 1
+            while os.path.exists(new_img_path):
+                new_img_path = os.path.join(images_target_path, f"{base}_{counter}{ext}")
+                counter += 1
+
+        shutil.copy2(img_source_path, new_img_path)
+        logging.info(f"图片迁移成功: {img_path} → {new_img_path}")
+
+        if use_subfolders:
+            new_relative_image_path = f"./{images_folder}/{filename_without_ext}/{os.path.basename(new_img_path)}"
+        else:
+            new_relative_image_path = f"./{images_folder}/{os.path.basename(new_img_path)}"
+
+        content = content.replace(img_path, new_relative_image_path.replace("\\", "/"))
+
+    new_md_file_path = os.path.join(target_path, os.path.basename(md_file_path))
+    with open(new_md_file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    logging.info(f"Markdown 文件处理完成，保存到: {new_md_file_path}")
+    return content
+
+
+def process_markdown_directory(md_dir_path, target_path, images_folder="images", merge=False, use_subfolders=False):
+    """批量处理 Markdown 文件，支持合并到一个文件"""
+    merged_content = ""
+
+    for root, _, files in os.walk(md_dir_path):
+        for file in files:
+            if file.lower().endswith(".md"):
+                md_file_path = os.path.join(root, file)
+                processed_content = process_markdown_file(md_file_path, target_path, images_folder, use_subfolders)
+                if merge:
+                    header = f"\n\n# 来自文件: {os.path.basename(md_file_path)}\n\n"
+                    merged_content += header + processed_content
+
+    if merge:
+        merged_file_path = os.path.join(target_path, "合并后的文档.md")
+        with open(merged_file_path, "w", encoding="utf-8") as f:
+            f.write(merged_content)
+        logging.info(f"所有 Markdown 文件已合并并保存至: {merged_file_path}")
 
 
 if __name__ == "__main__":
