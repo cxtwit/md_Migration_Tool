@@ -183,7 +183,7 @@ class App(ctk.CTkFrame):
         container = ctk.CTkFrame(frame, fg_color="transparent")
         container.grid(row=0, column=0)
 
-        ctk.CTkLabel(container, text="E_Star Markdown 小", font=ctk.CTkFont(size=40, weight="bold")).pack(pady=(0, 10))
+        ctk.CTkLabel(container, text="E_Star Markdown", font=ctk.CTkFont(size=40, weight="bold")).pack(pady=(0, 10))
         ctk.CTkLabel(container, text="by cxtwit", font=ctk.CTkFont(size=16)).pack(pady=(0, 40))
         ctk.CTkButton(container, text="开始文件迁移", height=50, font=ctk.CTkFont(size=16), command=lambda: self.select_frame_by_name("migration")).pack(pady=10, ipadx=10)
         
