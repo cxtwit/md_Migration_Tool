@@ -1,4 +1,0 @@
-customtkinter
-tkinterdnd2
-requests
-Pillow
