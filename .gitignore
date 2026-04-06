@@ -1,0 +1,27 @@
+# Claude Code
+.claude/
+
+# CLAUDE.md (AI assistant context file)
+CLAUDE.md
+
+# Runtime logs
+EStar_*.log
+
+# PyInstaller build output
+dist/
+build/
+*.spec
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
