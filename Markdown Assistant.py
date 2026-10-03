@@ -7,7 +7,7 @@ import requests
 import time
 import threading
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from collections import deque
 
 from PySide6.QtWidgets import (
@@ -140,6 +140,23 @@ QCheckBox::indicator:hover {{ border-color: #0066FF; }}
 """
 
 # ============================================================================
+# 1.5 图片引用解析 (Markdown image syntax)
+# ============================================================================
+# 支持三种写法，path 组不含尖括号，title 原样保留；重写时按原样重建。
+#   ![alt](dest)          ![alt](dest "title")      ![alt](<dest with space>)
+IMG_RE = re.compile(
+    r'(?P<lead>!\[.*?\]\(\s*)'
+    r'(?P<bracket><)?'
+    r'(?P<path>[^)\n]*?)'
+    r'(?(bracket)>)'
+    r'''(?P<tail>\s*(?:"[^"]*"|'[^']*'|\([^)]*\))?\s*\))'''
+)
+
+# 图片扩展名（审计 / 原地整理共用）
+IMG_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp',
+            '.tiff', '.tif', '.ico', '.avif', '.jfif', '.heic'}
+
+# ============================================================================
 # 2. 拖拽路径输入框
 # ============================================================================
 class DragLineEdit(QLineEdit):
@@ -253,17 +270,18 @@ class LaunchCard(QPushButton):
 # 5. 业务逻辑
 # ============================================================================
 class MarkdownLogicCore(QObject):
-    log_signal           = Signal(str)
-    task_finished        = Signal(bool, str)
-    scan_finished        = Signal(list)
-    info_ready           = Signal(dict)
-    rename_preview_ready = Signal(str)   # (preview_text,)
-    rename_count_ready   = Signal(int)   # 改进4：传递文件数
-    undo_available       = Signal(int)   # 改进8：传可撤销步数（0=不可撤销）
+    log_signal            = Signal(str)
+    task_finished         = Signal(bool, str)
+    scan_finished         = Signal(list, str)   # (未引用图片列表, 扫描根目录)
+    info_ready            = Signal(dict)
+    rename_preview_ready  = Signal(str)   # (preview_text,)
+    rename_count_ready    = Signal(int)   # 改进4：传递文件数
+    undo_available        = Signal(int)   # 改进8：传可撤销步数（0=不可撤销）
+    inplace_preview_ready = Signal(int, int, str, bool)  # (MD数, 图片数, 目录, 是否清理)
 
     def __init__(self):
         super().__init__()
-        self.img_pattern = r'!\[.*?\]\((.*?)\)'
+        self.img_pattern = IMG_RE.pattern
         self.rename_history = []
         self._cancel = threading.Event()  # 改进9：取消标志
 
@@ -283,6 +301,81 @@ class MarkdownLogicCore(QObject):
         while os.path.exists(new_path):
             new_path = os.path.join(target_dir, f"{base}_{counter}{ext}"); counter += 1
         return new_path
+
+    # --- 图片引用解析（加固：支持 title 与 <含空格路径>）---
+    def _img_refs(self, text):
+        """按出现顺序返回图片引用目标（已剥离尖括号包裹）"""
+        refs = []
+        for m in IMG_RE.finditer(text):
+            ref = m.group('path').strip()
+            if ref:
+                refs.append(ref)
+        return refs
+
+    def _is_remote(self, ref):
+        return ref.lower().startswith(('http://', 'https://', '//',
+                                       'data:', 'ftp://', 'mailto:', 'file:'))
+
+    def _is_within(self, path, root):
+        """path 是否位于 root 目录内（含相等）"""
+        try:
+            p = os.path.normcase(os.path.abspath(path))
+            r = os.path.normcase(os.path.abspath(root))
+            return os.path.commonpath([p, r]) == r
+        except ValueError:
+            return False
+
+    def _local_target(self, base_dir, ref):
+        """把图片引用解析成本地绝对路径；远程/空引用返回 None"""
+        p = (ref or "").strip()
+        if not p or self._is_remote(p):
+            return None
+        cand = os.path.normpath(os.path.join(base_dir, self.normalize_path(p)))
+        if os.path.exists(cand):
+            return cand
+        dec = unquote(p)                # 兼容 %20 之类 URL 编码写法
+        if dec != p:
+            alt = os.path.normpath(os.path.join(base_dir, self.normalize_path(dec)))
+            if os.path.exists(alt):
+                return alt
+        return cand
+
+    def _rewrite_images(self, text, resolver):
+        """按 resolver(原引用) -> 新引用 or None 重写图片链接，保留 <> 与 title"""
+        def _sub(m):
+            new = resolver(m.group('path').strip())
+            if not new:
+                return m.group(0)
+            if m.group('bracket'):
+                return f"{m.group('lead')}<{new}>{m.group('tail')}"
+            return f"{m.group('lead')}{new}{m.group('tail')}"
+        return IMG_RE.sub(_sub, text)
+
+    def _inplace_candidate(self, src, folder):
+        """只有当前目录内、且不在 images/ 里的图片才需要归档"""
+        if os.path.splitext(src)[1].lower() not in IMG_EXTS:
+            return False
+        if not self._is_within(src, folder):
+            return False                # 目录之外（如 ../shared/x.png）不搬动
+        return not self._is_within(src, os.path.join(folder, "images"))
+
+    def _download_image(self, url, tdir):
+        """下载远程图片并落盘，返回绝对路径；失败返回空串"""
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()        # 加固：避免把 404 页面当成图片写入
+            n = os.path.basename(unquote(urlparse(url).path))
+            if not n or '.' not in n:
+                cd = r.headers.get('Content-Disposition', '')
+                m = re.search(r'filename=["\']?([^"\';\s]+)', cd)
+                n = m.group(1) if m else f"web_{int(time.time())}.jpg"
+            p = self._get_unique_path(tdir, n)
+            with open(p, 'wb') as wf: wf.write(r.content)
+            self.log(f" [下载] {n}")
+            return os.path.normpath(p)
+        except Exception as e:
+            self.log(f"[错误] 下载 {url} 失败: {e}")
+            return ""
 
     # --- Rename Logic ---
     def execute_rename_batch(self, folder, pattern, start_num, pad):
@@ -353,7 +446,8 @@ class MarkdownLogicCore(QObject):
         else: self.task_finished.emit(False, "路径无效")
 
     def _analyze_batch(self, root):
-        mds = [os.path.join(r, x) for r, _, fs in os.walk(root) for x in fs if x.endswith('.md')]
+        mds = [os.path.join(r, x) for r, _, fs in os.walk(root)
+               for x in fs if x.lower().endswith('.md')]
         # 改进6：全局 union，去重后再统计
         all_ref_abs, all_img_abs = set(), set()
         for m in mds:
@@ -372,17 +466,28 @@ class MarkdownLogicCore(QObject):
         })
 
     def _analyze_single(self, fpath):
-        r = self._core_audit(fpath)
-        if r:
-            reds = list(r['img_abs'] - r['ref_abs'])
-            self.info_ready.emit({
-                "md_cnt":  1,
-                "ref_cnt": len(r['ref_abs']),
-                "phy_cnt": len(r['img_abs']),
-                "red_cnt": len(reds),
-                "red_list": reds,
-                "scan_root": os.path.dirname(fpath),
-            })
+        """单文件审计：同目录树下其它 MD 的引用一并计入，
+        避免把别人正在用的图片误报成冗余（加固）"""
+        md_dir = os.path.dirname(os.path.abspath(fpath))
+        sibs = [os.path.join(r, x) for r, _, fs in os.walk(md_dir)
+                for x in fs if x.lower().endswith('.md')]
+        ref_abs, img_abs = set(), set()
+        for m in sibs:
+            r = self._core_audit(m)
+            if r:
+                ref_abs |= r['ref_abs']
+                img_abs |= r['img_abs']
+        if len(sibs) > 1:
+            self.log(f" [提示] 同目录树下另有 {len(sibs) - 1} 个 MD，其引用已一并计入")
+        reds = list(img_abs - ref_abs)
+        self.info_ready.emit({
+            "md_cnt":  1,
+            "ref_cnt": len(ref_abs),
+            "phy_cnt": len(img_abs),
+            "red_cnt": len(reds),
+            "red_list": reds,
+            "scan_root": md_dir,
+        })
 
     def _core_audit(self, fpath):
         """返回 {ref_abs: set[str], img_abs: set[str]}，路径均为 normpath 绝对路径"""
@@ -391,16 +496,15 @@ class MarkdownLogicCore(QObject):
             with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
                 c = f.read()
             ref_abs = set()
-            for m in re.findall(self.img_pattern, c):
-                if m.startswith('http'): continue
-                ref_abs.add(os.path.normpath(os.path.join(md_dir, self.normalize_path(m))))
+            for ref in self._img_refs(c):
+                p = self._local_target(md_dir, ref)
+                if p: ref_abs.add(p)
 
-            img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.tiff', '.ico'}
             img_abs = set()
             for root, dirs, files in os.walk(md_dir):
                 dirs[:] = [d for d in dirs if d != 'unused_backup']
                 for fn in files:
-                    if os.path.splitext(fn)[1].lower() in img_exts:
+                    if os.path.splitext(fn)[1].lower() in IMG_EXTS:
                         img_abs.add(os.path.normpath(os.path.join(root, fn)))
             return {"ref_abs": ref_abs, "img_abs": img_abs}
         except Exception as e:
@@ -417,7 +521,8 @@ class MarkdownLogicCore(QObject):
                     else:
                         bd = os.path.join(os.path.dirname(p), "unused_backup")
                         os.makedirs(bd, exist_ok=True)
-                        shutil.move(p, os.path.join(bd, os.path.basename(p)))
+                        # 不同子目录下的同名冗余文件不能互相覆盖
+                        shutil.move(p, self._get_unique_path(bd, os.path.basename(p)))
                         self.log(f"[移] {os.path.basename(p)}")
                     cnt += 1
                 except Exception as e:
@@ -428,17 +533,25 @@ class MarkdownLogicCore(QObject):
     def process_migration(self, src, dst, cfg):
         self._reset_cancel()
         try:
-            fs = []
-            if os.path.isfile(src): fs = [src]
+            dst_abs = os.path.abspath(dst)
+            dst = dst_abs               # 后续统一用绝对路径，避免相对基准不一致
+            src_root, fs = None, []
+            if os.path.isfile(src):
+                src_root = os.path.dirname(os.path.abspath(src))
+                fs = [src]
             elif os.path.isdir(src):
-                fs = [os.path.join(r, f) for r, _, x in os.walk(src) for f in x if f.endswith('.md')]
+                src_root = os.path.abspath(src)
+                fs = [os.path.join(r, f) for r, _, x in os.walk(src)
+                      for f in x if f.lower().endswith('.md')]
+                # 目标目录若在源目录之内，跳过其中的文件，避免把产物当成待迁移文档
+                fs = [f for f in fs if not self._is_within(f, dst_abs)]
 
             if not fs: return self.task_finished.emit(False, "无 MD 文件")
 
             out_md = os.path.abspath(os.path.join(dst, "合并后的文档.md"))
             fs = [f for f in fs if os.path.abspath(f) != out_md]
 
-            merged, procs = "", []
+            merged, refs, skipped = "", set(), 0
             self.log(f"--- [迁移] {len(fs)} 文件 -> {dst} ---")
 
             for f in fs:
@@ -446,134 +559,209 @@ class MarkdownLogicCore(QObject):
                     self.task_finished.emit(False, "已取消")
                     return
                 self.log(f"处理: {os.path.basename(f)}")
-                cnt = self._mig_core(f, dst, cfg); procs.append(cnt)
-                if cfg['merge']: merged += f"\n\n# {os.path.basename(f)}\n\n" + cnt
+                try:
+                    txt, ref = self._mig_core(f, dst, cfg, src_root)
+                except Exception as e:      # 单个文档失败不拖垮整批
+                    skipped += 1
+                    self.log(f"[跳过] {os.path.basename(f)}: {e}")
+                    continue
+                refs |= ref
+                if cfg['merge']: merged += f"\n\n# {os.path.basename(f)}\n\n" + txt
 
             if cfg['merge'] and merged:
                 with open(out_md, 'w', encoding='utf-8') as f: f.write(merged)
                 self.log(f"合并完成: {out_md}")
 
-            unused = self._scan_unused(procs, dst) if cfg['cleanup'] else []
-            self.scan_finished.emit(unused)
-            self.task_finished.emit(True, f"迁移成功！已处理 {len(fs)} 个文件。")
+            unused = self._scan_unused(refs, dst) if cfg['cleanup'] else []
+            self.scan_finished.emit(unused, dst)
+            tail = f"（{skipped} 个跳过）" if skipped else ""
+            self.task_finished.emit(True, f"迁移成功！已处理 {len(fs) - skipped} 个文件。{tail}")
         except Exception as e:
             self.task_finished.emit(False, str(e))
 
-    def _mig_core(self, fpath, root, cfg):
+    def _mig_core(self, fpath, root, cfg, src_root=None):
+        """搬运/下载单个文档引用的图片并重写链接。
+        返回 (新文本, 已落地图片的绝对路径集合)"""
         name = os.path.splitext(os.path.basename(fpath))[0]
+        fpath, root = os.path.abspath(fpath), os.path.abspath(root)
         tdir = os.path.join(root, "images", name) if cfg['subfolder'] else os.path.join(root, "images")
         os.makedirs(tdir, exist_ok=True)
+
+        # 非合并模式保留源目录结构，避免不同目录下的同名文档互相覆盖
+        if src_root:
+            rel_doc = os.path.relpath(os.path.abspath(fpath), src_root)
+        else:
+            rel_doc = os.path.basename(fpath)
+        out_path = os.path.join(root, rel_doc)
+        out_dir = os.path.dirname(out_path)
+        # 合并模式下正文落在 root/合并后的文档.md，链接基准目录因此是 root
+        link_base = root if cfg.get('merge') else out_dir
+
         with open(fpath, 'r', encoding='utf-8') as f:
             txt = f.read()
-        for u in re.findall(self.img_pattern, txt):
-            new_abs = ""
-            if u.startswith('http'):
-                if cfg['download']:
-                    try:
-                        r = requests.get(u, timeout=10)
-                        n = os.path.basename(urlparse(u).path)
-                        if not n or '.' not in n:
-                            cd = r.headers.get('Content-Disposition', '')
-                            m = re.search(r'filename=["\']?([^"\';\s]+)', cd)
-                            n = m.group(1) if m else f"web_{int(time.time())}.jpg"
-                        p = self._get_unique_path(tdir, n)
-                        with open(p, 'wb') as wf: wf.write(r.content)
-                        new_abs = p
-                        self.log(f" [下载] {n}")
-                    except Exception as e:
-                        self.log(f"[错误] 下载 {u} 失败: {e}")
-            else:
-                src = os.path.abspath(os.path.join(os.path.dirname(fpath), self.normalize_path(u)))
-                if os.path.exists(src):
-                    new_abs = self._get_unique_path(tdir, os.path.basename(src))
-                    shutil.copy2(src, new_abs)
 
-            if new_abs:
-                sub = f"{name}/" if cfg['subfolder'] else ""
-                rel = f"./images/{sub}{os.path.basename(new_abs)}".replace("//", "/")
-                txt = re.sub(
-                    r'(!\[.*?\]\()' + re.escape(u) + r'(\))',
-                    lambda mo: mo.group(1) + rel + mo.group(2),
-                    txt
-                )
+        refs, cache, cache_src = set(), {}, {}
+
+        def resolve(raw):
+            if raw in cache:
+                return cache[raw]
+            dest = ""
+            if self._is_remote(raw):
+                if cfg['download'] and raw.lower().startswith(('http://', 'https://')):
+                    dest = self._download_image(raw, tdir)
+            else:
+                s = self._local_target(os.path.dirname(fpath), raw)
+                if s and os.path.exists(s):
+                    if s in cache_src:
+                        dest = cache_src[s]
+                    else:
+                        dest = self._get_unique_path(tdir, os.path.basename(s))
+                        try:
+                            shutil.copy2(s, dest)
+                            cache_src[s] = dest
+                            refs.add(os.path.normpath(dest))
+                        except Exception as e:
+                            self.log(f"[错误] 复制 {os.path.basename(s)} 失败: {e}")
+                            dest = ""
+                else:
+                    self.log(f" [跳过] 未找到: {raw}")
+            if dest:
+                # 链接相对“文档落盘位置”计算，嵌套目录下也不会失效
+                link = os.path.relpath(dest, link_base).replace("\\", "/")
+                if not link.startswith((".", "/")):
+                    link = "./" + link
+                cache[raw] = link
+            else:
+                cache[raw] = ""
+            return cache[raw]
+
+        txt = self._rewrite_images(txt, resolve)
 
         if not cfg.get('merge'):
-            with open(os.path.join(root, os.path.basename(fpath)), 'w', encoding='utf-8') as f:
+            os.makedirs(out_dir, exist_ok=True)
+            if os.path.abspath(out_path) != os.path.abspath(fpath) and os.path.exists(out_path):
+                self.log(f" [覆盖] {os.path.basename(out_path)}")
+            with open(out_path, 'w', encoding='utf-8') as f:
                 f.write(txt)
-        return txt
+        return txt, refs
 
-    def _scan_unused(self, cnts, root):
-        refs = {os.path.basename(self.normalize_path(r))
-                for c in cnts for r in re.findall(self.img_pattern, c)}
+    def _scan_unused(self, refs, root):
+        """refs: 已引用图片的绝对路径集合；返回 images/ 下未被引用的文件"""
         u = []
         img_root = os.path.join(root, "images")
-        if os.path.exists(img_root):
-            for r, _, fs in os.walk(img_root):
-                if "unused" in r: continue
-                for f in fs:
-                    if f not in refs: u.append(os.path.join(r, f))
+        if not os.path.isdir(img_root):
+            return u
+        for r, dirs, fs in os.walk(img_root):
+            dirs[:] = [d for d in dirs if d != 'unused_backup']
+            for f in fs:
+                p = os.path.normpath(os.path.join(r, f))
+                if p not in refs:       # 按绝对路径比对，同名图片不会互相顶替
+                    u.append(p)
         return u
 
     # --- Inplace Logic ---
     def process_inplace(self, folder, cln):
         self._reset_cancel()
         try:
-            fs = [f for f in os.listdir(folder) if f.endswith('.md')]
+            folder = os.path.abspath(folder)
+            fs = [f for f in os.listdir(folder) if f.lower().endswith('.md')]
             if not fs: return self.task_finished.emit(False, "无 MD 文件")
             self.log(f"--- [原地] 处理 {len(fs)} 文件 ---")
-            procs = []
+            img_dir = os.path.join(folder, "images")
+
+            # 预统计：每张待归档图片被多少个文档引用（同文档内重复只算一次）
+            ref_docs = {}
+            for fn in fs:
+                try:
+                    with open(os.path.join(folder, fn), 'r', encoding='utf-8') as f:
+                        txt = f.read()
+                except Exception:
+                    continue
+                for raw in set(self._img_refs(txt)):
+                    src = self._local_target(folder, raw)
+                    if src and self._inplace_candidate(src, folder):
+                        ref_docs[src] = ref_docs.get(src, 0) + 1
+
+            refs, skipped = set(), 0
             for fn in fs:
                 if self._cancel.is_set():   # 改进9
                     self.task_finished.emit(False, "已取消")
                     return
                 fp = os.path.join(folder, fn)
-                md_dir = os.path.dirname(fp)
                 pfx = os.path.splitext(fn)[0]
-                img_dir = os.path.join(md_dir, "images")
+                try:
+                    with open(fp, 'r', encoding='utf-8') as f:
+                        txt = f.read()
+                except Exception as e:      # 非 UTF-8 文档跳过，避免回写时损坏内容
+                    skipped += 1
+                    self.log(f"[跳过] {fn}: {e}")
+                    continue
                 os.makedirs(img_dir, exist_ok=True)
-                with open(fp, 'r', encoding='utf-8') as f:
-                    txt = f.read()
-                local_count = 0
-                for u in re.findall(self.img_pattern, txt):
-                    if u.startswith(('http', './images/')): continue
-                    src = os.path.join(md_dir, self.normalize_path(u))
-                    if os.path.exists(src):
-                        nn = f"{pfx}_{local_count+1}{os.path.splitext(src)[1]}"
-                        shutil.move(src, os.path.join(img_dir, nn))
-                        txt = re.sub(
-                            r'(!\[.*?\]\()' + re.escape(u) + r'(\))',
-                            lambda mo, r=f"./images/{nn}": mo.group(1) + r + mo.group(2),
-                            txt
-                        )
-                        self.log(f" [整理] {os.path.basename(src)} -> {nn}")
-                        local_count += 1
+                local_count, cache = 0, {}
+
+                def resolve(raw, pfx=pfx, cache=cache):
+                    nonlocal local_count
+                    if raw in cache:
+                        return cache[raw]
+                    out = ""
+                    src = self._local_target(folder, raw)
+                    if src and os.path.exists(src):
+                        if self._is_within(src, img_dir):
+                            refs.add(os.path.normpath(src))   # 已在 images/ 内：只登记引用
+                        elif self._inplace_candidate(src, folder):
+                            # 最后一个引用者负责搬移，其余引用者复制，避免搬断链接
+                            left = ref_docs.get(src, 1) - 1
+                            ref_docs[src] = left
+                            local_count += 1
+                            nn = self._get_unique_path(
+                                img_dir, f"{pfx}_{local_count}{os.path.splitext(src)[1]}")
+                            try:
+                                if left <= 0: shutil.move(src, nn)
+                                else:         shutil.copy2(src, nn)
+                                self.log(f" [{'移动' if left <= 0 else '复制'}] "
+                                         f"{os.path.basename(src)} -> {os.path.basename(nn)}")
+                                refs.add(os.path.normpath(nn))
+                                out = f"./images/{os.path.basename(nn)}"
+                            except Exception as e:
+                                self.log(f"[错误] 整理 {os.path.basename(src)} 失败: {e}")
+                    cache[raw] = out
+                    return out
+
+                txt = self._rewrite_images(txt, resolve)
                 with open(fp, 'w', encoding='utf-8') as f:
                     f.write(txt)
-                procs.append(txt)
-            u = self._scan_unused(procs, folder) if cln else []
-            self.scan_finished.emit(u)
-            self.task_finished.emit(True, f"整理完成！已处理 {len(fs)} 个文件。")
+
+            u = self._scan_unused(refs, folder) if cln else []
+            self.scan_finished.emit(u, folder)
+            tail = f"（{skipped} 个跳过）" if skipped else ""
+            self.task_finished.emit(True, f"整理完成！已处理 {len(fs) - skipped} 个文件。{tail}")
         except Exception as e:
             self.task_finished.emit(False, str(e))
 
     def scan_inplace_preview(self, folder):
-        """改进3：扫描原地整理会影响哪些文件，不写磁盘"""
+        """改进3：扫描原地整理会影响哪些文件，不写磁盘（在后台线程调用）"""
         try:
-            img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.tiff', '.ico'}
-            md_files = [f for f in os.listdir(folder) if f.endswith('.md')]
+            folder = os.path.abspath(folder)
+            md_files = [f for f in os.listdir(folder) if f.lower().endswith('.md')]
             img_count = 0
             for fn in md_files:
-                fp = os.path.join(folder, fn)
-                with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
-                    txt = f.read()
-                for u in re.findall(self.img_pattern, txt):
-                    if u.startswith(('http', './images/')): continue
-                    src = os.path.join(folder, self.normalize_path(u))
-                    if os.path.exists(src) and os.path.splitext(src)[1].lower() in img_exts:
+                try:
+                    with open(os.path.join(folder, fn), 'r', encoding='utf-8', errors='ignore') as f:
+                        txt = f.read()
+                except Exception:
+                    continue
+                for raw in set(self._img_refs(txt)):
+                    src = self._local_target(folder, raw)
+                    if src and os.path.exists(src) and self._inplace_candidate(src, folder):
                         img_count += 1
             return len(md_files), img_count
         except Exception:
             return 0, 0
+
+    def scan_inplace_preview_async(self, folder, cln):
+        """缺陷7：预扫描在工作线程执行，结果经信号回到 UI 线程"""
+        md_cnt, img_cnt = self.scan_inplace_preview(folder)
+        self.inplace_preview_ready.emit(md_cnt, img_cnt, folder, cln)
 
 # ============================================================================
 # 6. 主窗口
@@ -604,6 +792,7 @@ class EStarApp(QMainWindow):
         self.core.rename_preview_ready.connect(self.on_ren_preview)
         self.core.rename_count_ready.connect(self.on_ren_count)     # 改进4
         self.core.undo_available.connect(self.on_undo_state_change) # 改进8
+        self.core.inplace_preview_ready.connect(self.on_inplace_preview)
 
         # 防抖计时器（改进：按键防抖）
         self._preview_timer = QTimer(self)
@@ -613,6 +802,7 @@ class EStarApp(QMainWindow):
 
         # 状态初始化
         self.red_list = []
+        self._scan_root = ""   # 当前冗余清单的来源目录
         self._busy = False   # 改进2：忙碌标志
 
         self.recent_logs = deque(maxlen=100)
@@ -673,9 +863,6 @@ class EStarApp(QMainWindow):
             btn.setText(busy_text)
         else:
             btn.setText(idle_text or getattr(btn, '_idle_text', btn.text()))
-        # 显示/隐藏取消按钮（如果页面有的话）
-        if hasattr(self, '_cancel_btn'):
-            self._cancel_btn.setVisible(busy)
 
     # ── 首页 ───────────────────────────────────────────────────────────────
     def init_launchpad(self):
@@ -944,7 +1131,12 @@ class EStarApp(QMainWindow):
 
     def _do_clean_and_rescan(self, forever):
         self.core.cleanup_files(self.red_list, forever)
-        self.core.analyze_path_entry(self.audit_path.text())
+        # 重新扫描冗余清单的来源目录，而不是审计页里可能为空/无关的路径
+        target = self._scan_root or self.audit_path.text().strip()
+        if not target:
+            return
+        self.audit_path.setText(target)
+        self.core.analyze_path_entry(target)
 
     def start_mig(self):
         # 改进7：迁移前路径即时校验
@@ -1019,9 +1211,16 @@ class EStarApp(QMainWindow):
     def start_inp(self, cln):
         p = QFileDialog.getExistingDirectory(self, "选目录")
         if not p: return
+        # 缺陷7：预扫描放到后台线程，避免大目录卡住界面
+        btn = self.b_inp_clean if cln else self.b_inp_only
+        self.set_busy(True, btn, "扫描中…")
+        threading.Thread(target=self.core.scan_inplace_preview_async,
+                         args=(p, cln), daemon=True).start()
 
-        # 改进3：扫描后给出确认信息
-        md_cnt, img_cnt = self.core.scan_inplace_preview(p)
+    def on_inplace_preview(self, md_cnt, img_cnt, folder, cln):
+        """改进3：预扫描结果回到 UI 线程后再弹确认框"""
+        btn = self.b_inp_clean if cln else self.b_inp_only
+        self.set_busy(False, btn, idle_text="整理并清理" if cln else "仅整理")
         if md_cnt == 0:
             QMessageBox.warning(self, "提示", "所选目录中没有找到 MD 文件。"); return
 
@@ -1037,16 +1236,16 @@ class EStarApp(QMainWindow):
         msg.setDefaultButton(QMessageBox.Cancel)
         if msg.exec() != QMessageBox.Ok: return
 
-        self.set_busy(True, self.b_inp_clean if cln else self.b_inp_only, "整理中…")
+        self.set_busy(True, btn, "整理中…")
         self.b_inp_cancel.setVisible(True)   # 改进9
-        threading.Thread(target=self.core.process_inplace, args=(p, cln), daemon=True).start()
+        threading.Thread(target=self.core.process_inplace,
+                         args=(folder, cln), daemon=True).start()
 
     def on_task_done(self, ok, msg):
         # 改进2：所有任务完成时恢复按钮
         for btn, idle in [
             (self.b_mig,    "执行迁移"),
             (self.b_rename, "执行重命名"),
-            (self.b_undo,   None),           # undo 文字由 on_undo_state_change 控制
             (self.b_inp_only,  "仅整理"),
             (self.b_inp_clean, "整理并清理"),
             (self.b_audit,  "开始扫描"),
@@ -1054,6 +1253,9 @@ class EStarApp(QMainWindow):
             if not btn.isEnabled():
                 btn.setEnabled(True)
                 if idle: btn.setText(idle)
+
+        # 缺陷6：撤销按钮是否可用只由历史记录决定，历史用尽后不再可点
+        self.on_undo_state_change(len(self.core.rename_history))
 
         # 隐藏取消按钮
         self.b_mig_cancel.setVisible(False)
@@ -1063,9 +1265,10 @@ class EStarApp(QMainWindow):
         if ok: QMessageBox.information(self, "完成", msg)
         else:  QMessageBox.warning(self, "提示", msg)
 
-    def on_scan_done(self, u):
+    def on_scan_done(self, u, root):
         if u:
             self.red_list = u
+            self._scan_root = root
             self.do_clean_check()
 
 
