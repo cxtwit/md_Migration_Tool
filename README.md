@@ -4,7 +4,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![GUI](https://img.shields.io/badge/GUI-PySide6-green)
-![License](https://img.shields.io/badge/License-MIT-orange)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue)
 
 **Markdown小助手** 是一款专为创作者打造的本地化工具。它可以帮你自动化处理文档中的图片引用、清理冗余资源、批量重命名以及跨目录迁移文档，彻底解决"图片乱放"、"链接失效"和"文件名混乱"的痛点。
 
@@ -87,4 +87,4 @@ pyinstaller --onefile --windowed "Markdown Assistant.py"
 
 ## 📄 License
 
-MIT
+Apache-2.0（见 [LICENSE](LICENSE)）
