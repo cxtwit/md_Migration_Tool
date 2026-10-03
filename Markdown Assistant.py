@@ -769,7 +769,7 @@ class MarkdownLogicCore(QObject):
 class EStarApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MarkDown 小助手 v2026.30")
+        self.setWindowTitle("MarkDown 小助手 v2026.10")
         self.resize(1180, 800)
 
         # 应用图标（打包后从 sys._MEIPASS 读取，开发时从脚本同目录读取）
